@@ -157,8 +157,11 @@ Once you generate a token with `vipaccess provision`, use `vipaccess uri` to sho
 [`qrencode`](https://fukuchi.org/works/qrencode/manual/index.html) to display that URI as a QR code:
 
 ```
-$ qrencode -t UTF8 'otpauth://totp/VIP%20Access:SYMCXXXX?secret=YYYY&issuer=Symantec&algorithm=SHA1&digits=6'
+$ qrencode -t UTF8 'otpauth://totp/VIP%20Access:SYMCXXXX?secret=YYYY'
 ```
+
+The generated URI intentionally omits the optional remote `image=` parameter so authenticator apps do not
+fetch an icon from a third-party host while importing your secret.
 
 Scan the code into your TOTP generating app,
 like [FreeOTP](https://freeotp.github.io/) or
@@ -188,3 +191,17 @@ As alluded to above, you can use other standard
 [OATH](https://en.wikipedia.org/wiki/Initiative_For_Open_Authentication)-based
 tools to generate the 6-digit codes identical to what Symantec's official
 apps produce.
+
+### Tests
+
+The default test suite is unit-only and does not contact Symantec's live services:
+
+```
+$ python -m nose2 -v
+```
+
+If you explicitly want to run the live integration tests too, opt in with:
+
+```
+$ VIPACCESS_RUN_LIVE_TESTS=1 python -m nose2 -v
+```

@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-from setuptools import setup
 from io import open
 from os import path
+import re
+
+from setuptools import setup
 
 version_py = path.join('vipaccess', 'version.py')
 
-d = {}
-with open(version_py, 'r') as fh:
-    exec(fh.read(), d)
-    version_pep = d['__version__']
+with open(version_py, 'r', encoding='utf-8') as fh:
+    version_match = re.search(r'^__version__\s*=\s*[\'"]([^\'"]+)[\'"]', fh.read(), re.MULTILINE)
+if version_match is None:
+    raise RuntimeError('Unable to determine package version from %s' % version_py)
+version_pep = version_match.group(1)
 
 setup(
     name='python-vipaccess',
     version=version_pep,
     description="A free software implementation of Symantec's VIP Access application and protocol",
-    long_description=open('README.md').read(),
+    long_description=open('README.md', encoding='utf-8').read(),
     long_description_content_type='text/markdown',
     url='https://github.com/dlenski/python-vipaccess',
     author='Daniel Lenski',

@@ -21,6 +21,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import re
 import string
 import sys
 import time
@@ -39,10 +40,13 @@ from oath import totp, hotp
 from vipaccess.version import __version__
 
 PROVISIONING_URL = 'https://services.vip.symantec.com/prov'
-VIP_ACCESS_LOGO = 'https://raw.githubusercontent.com/dlenski/python-vipaccess/master/vipaccess.png'
-
 TEST_URL = 'https://vip.symantec.com/otpCheck'
 SYNC_URL = 'https://vip.symantec.com/otpSync'
+DEFAULT_REQUEST_TIMEOUT = 20
+STATUS_MESSAGE_PATTERN = re.compile(
+    r'<span[^>]*class="[^"]*\bsixcode\b[^"]*"[^>]*>(.*?)</span>',
+    re.IGNORECASE | re.DOTALL,
+)
 
 HMAC_KEY = b'\xdd\x0b\xa6\x92\xc3\x8a\xa3\xa9\x93\xa3\xaa\x26\x96\x8c\xd9\xc2\xaa\x2a\xa2\xcb\x23\xb7\xc2\xd2\xaa\xaf\x8f\x8f\xc9\xa0\xa9\xa1'
 
@@ -95,8 +99,21 @@ def generate_request(**request_parameters):
 
     return REQUEST_TEMPLATE % request_parameters
 
-def get_provisioning_response(request, session=requests):
-    return session.post(PROVISIONING_URL, data=request)
+def _post(session, url, timeout=DEFAULT_REQUEST_TIMEOUT, **kwargs):
+    response = session.post(url, timeout=timeout, **kwargs)
+    response.raise_for_status()
+    return response
+
+
+def _get_vip_credential_status(response_text):
+    match = STATUS_MESSAGE_PATTERN.search(response_text)
+    if match is not None:
+        response_text = match.group(1)
+    return ' '.join(response_text.split()).lower()
+
+
+def get_provisioning_response(request, session=requests, timeout=DEFAULT_REQUEST_TIMEOUT):
+    return _post(session, PROVISIONING_URL, data=request, timeout=timeout)
 
 def get_token_from_response(response_xml):
     '''Retrieve relevant token details from Symantec's provisioning
@@ -162,7 +179,7 @@ def decrypt_key(token_iv, token_cipher):
 
     return otp_key
 
-def generate_otp_uri(token, secret, issuer='VIP Access', image=VIP_ACCESS_LOGO):
+def generate_otp_uri(token, secret, issuer='VIP Access', image=None):
     '''Generate the OTP URI.'''
     token_parameters = {}
     token_parameters['issuer'] = urllib.quote(issuer)
@@ -181,7 +198,7 @@ def generate_otp_uri(token, secret, issuer='VIP Access', image=VIP_ACCESS_LOGO):
     if token.get('digits', 6) != 6:  # 6 digits is the default
         data['digits'] = token['digits']
     if token.get('algorithm', 'SHA1').upper() != 'SHA1':  # SHA1 is the default
-        algorithm=token['algorithm'].upper(),
+        data['algorithm'] = token['algorithm'].upper()
     if token.get('counter') is not None: # HOTP
         data['counter'] = token['counter']
         token_parameters['otp_type'] = 'hotp'
@@ -194,7 +211,7 @@ def generate_otp_uri(token, secret, issuer='VIP Access', image=VIP_ACCESS_LOGO):
     token_parameters['parameters'] = urllib.urlencode(data, safe=':/')
     return 'otpauth://%(otp_type)s/%(issuer)s:%(account_name)s?%(parameters)s' % token_parameters
 
-def check_token(token, secret, session=requests, timestamp=None):
+def check_token(token, secret, session=requests, timestamp=None, timeout=DEFAULT_REQUEST_TIMEOUT):
     '''Check the validity of the generated token.'''
     secret_hex = binascii.b2a_hex(secret).decode('ascii')
     if token.get('counter') is not None: # HOTP
@@ -206,17 +223,18 @@ def check_token(token, secret, session=requests, timestamp=None):
     data = {'cr%s'%d:c for d,c in enumerate(otp, 1)}
     data['cred'] = token['id']
     data['continue'] = 'otp_check'
-    token_check = session.post(TEST_URL, data=data)
-    if "Your VIP Credential is working correctly" in token_check.text:
+    token_check = _post(session, TEST_URL, data=data, timeout=timeout)
+    status = _get_vip_credential_status(token_check.text)
+    if 'working correctly' in status:
         if token.get('counter') is not None:
             token['counter'] += 1
         return True
-    elif "Your VIP credential needs to be sync" in token_check.text:
+    elif 'need' in status and 'sync' in status:
         return False
     else:
         return None
 
-def sync_token(token, secret, session=requests, timestamp=None):
+def sync_token(token, secret, session=requests, timestamp=None, timeout=DEFAULT_REQUEST_TIMEOUT):
     '''Sync the generated token. This will fail for a TOTP token if performed less than 2 periods after the last sync or check.'''
     secret_hex = binascii.b2a_hex(secret).decode('ascii')
     if timestamp is None:
@@ -236,12 +254,13 @@ def sync_token(token, secret, session=requests, timestamp=None):
     data.update({'ncr%s'%d:c for d,c in enumerate(otp2, 1)})
     data['cred'] = token['id']
     data['continue'] = 'otp_sync'
-    token_check = session.post(SYNC_URL, data=data)
-    if "Your VIP Credential is successfully synced" in token_check.text:
+    token_check = _post(session, SYNC_URL, data=data, timeout=timeout)
+    status = _get_vip_credential_status(token_check.text)
+    if 'successfully synced' in status:
         if token.get('counter') is not None:
             token['counter'] += 2
         return True
-    elif "Your VIP credential needs to be sync" in token_check.text:
+    elif 'need' in status and 'sync' in status:
         return False
     else:
         return None

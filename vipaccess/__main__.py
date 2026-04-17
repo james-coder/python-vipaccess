@@ -6,6 +6,7 @@ import oath
 import time
 import base64
 import re
+import requests
 
 from vipaccess.patharg import PathType
 from vipaccess.version import __version__
@@ -62,7 +63,10 @@ def provision(p, args):
     request = vp.generate_request(token_model=args.token_model)
     print("Fetching provisioning response from Symantec server...")
     session = vp.requests.Session()
-    response = vp.get_provisioning_response(request, session)
+    try:
+        response = vp.get_provisioning_response(request, session)
+    except requests.RequestException as e:
+        p.error('Network error contacting Symantec provisioning service: %s' % e)
     print("Getting token from response...")
     try:
         otp_token = vp.get_token_from_response(response.content)
@@ -77,10 +81,14 @@ def provision(p, args):
     otp_secret = vp.decrypt_key(otp_token['iv'], otp_token['cipher'])
     otp_secret_b32 = base64.b32encode(otp_secret).upper().decode('ascii')
     print("Checking token against Symantec server...")
-    if not vp.check_token(otp_token, otp_secret, session):
+    try:
+        token_valid = vp.check_token(otp_token, otp_secret, session)
+    except requests.RequestException as e:
+        p.error('Network error validating token with Symantec: %s' % e)
+    if not token_valid:
         p.error("Something went wrong--the token could not be validated.\n"
                 "    (Check your system time; it differs from the server's by %d seconds)\n" % otp_token['timeskew'])
-    elif otp_token.get('period') and otp_token['timeskew'] > otp_token['period']/10:
+    elif otp_token.get('period') and abs(otp_token['timeskew']) > otp_token['period']/10:
         p.error("Your system time differs from the server's by %d seconds;\n"
                 "    The offset would be 'baked in' to the newly-created token.\n"
                 "    Fix system time and try again." % otp_token['timeskew'])
@@ -145,19 +153,22 @@ def check(p, args):
 
     print("Checking token...")
     session = vp.requests.Session()
-    for skew in (None, +d['period']//2, -d['period']//2, +d['period'], -d['period'], +d['period']*3//2, -d['period']*3//2):
-        if skew is None:
-            if vp.check_token(d, key, session):
-                print("Token is valid and working.")
-                break
+    try:
+        for skew in (None, +d['period']//2, -d['period']//2, +d['period'], -d['period'], +d['period']*3//2, -d['period']*3//2):
+            if skew is None:
+                if vp.check_token(d, key, session):
+                    print("Token is valid and working.")
+                    break
+            else:
+                print("Trying %+d seconds timeskew..." % skew)
+                if vp.check_token(d, key, session, timestamp=time.time()+skew):
+                    print("Token is valid and working, but we had to skew by %+d seconds (check your system time)\n" % skew)
+                    break
         else:
-            print("Trying %+d seconds timeskew..." % skew)
-            if vp.check_token(d, key, session, timestamp=time.time()+skew):
-                print("Token is valid and working, but we had to skew by %+d seconds (check your system time)\n" % skew)
-                break
-    else:
-        print("WARNING: Something went wrong--the token could not be validated.\n",
-              file=sys.stderr)
+            print("WARNING: Something went wrong--the token could not be validated.\n",
+                  file=sys.stderr)
+    except requests.RequestException as e:
+        p.error('Network error validating token with Symantec: %s' % e)
 
 def uri(p, args):
     if args.secret:

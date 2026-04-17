@@ -17,7 +17,10 @@
 
 import unittest
 import os
+import shutil
+import tempfile
 IS_GITHUB_CI = os.getenv('GITHUB_ACTIONS')
+RUN_LIVE_TESTS = os.getenv('VIPACCESS_RUN_LIVE_TESTS') == '1' and not IS_GITHUB_CI
 
 # Python 2/3 compatibility
 try:
@@ -25,10 +28,34 @@ try:
 except ImportError:
     import urlparse
 
+import requests
+
+import vipaccess.provision as provision
+from vipaccess.patharg import PathType
 from vipaccess.provision import *
 
 from time import sleep
 from warnings import warn
+
+
+class FakeResponse(object):
+    def __init__(self, text='', status_code=200):
+        self.text = text
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError('HTTP %d' % self.status_code)
+
+
+class FakeSession(object):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
 
 
 def test_generate_request():
@@ -88,7 +115,7 @@ def test_generate_totp_uri():
         'timeskew': 0,
     }
     test_secret = b'ZqeD\xd9wg]"\x12\x1f7\xc7v6"\xf0\x13\\i'
-    expected_uri = urlparse.urlparse('otpauth://totp/VIP%20Access:SYMC26070843?secret=LJYWKRGZO5TV2IQSD434O5RWELYBGXDJ&image=' + VIP_ACCESS_LOGO)
+    expected_uri = urlparse.urlparse('otpauth://totp/VIP%20Access:SYMC26070843?secret=LJYWKRGZO5TV2IQSD434O5RWELYBGXDJ')
     generated_uri = urlparse.urlparse(generate_otp_uri(test_token, test_secret))
     assert expected_uri.scheme == generated_uri.scheme
     assert expected_uri.netloc == generated_uri.netloc
@@ -112,7 +139,7 @@ def test_generate_hotp_uri():
         'timeskew': 0,
     }
     test_secret = b'\x9a\x13\xcd2!\xad\xbd\x97R\xfcEE\xb6\x92e\xb4\x14\xb0\xfem'
-    expected_uri = urlparse.urlparse('otpauth://hotp/VIP%20Access:UBHE57586348?counter=1&secret=TIJ42MRBVW6ZOUX4IVC3NETFWQKLB7TN&image=' + VIP_ACCESS_LOGO)
+    expected_uri = urlparse.urlparse('otpauth://hotp/VIP%20Access:UBHE57586348?counter=1&secret=TIJ42MRBVW6ZOUX4IVC3NETFWQKLB7TN')
     generated_uri = urlparse.urlparse(generate_otp_uri(test_token, test_secret))
     assert expected_uri.scheme == generated_uri.scheme
     assert expected_uri.netloc == generated_uri.netloc
@@ -120,9 +147,66 @@ def test_generate_hotp_uri():
     assert urlparse.parse_qs(expected_uri.params) == urlparse.parse_qs(generated_uri.params)
     assert urlparse.parse_qs(expected_uri.query) == urlparse.parse_qs(generated_uri.query)
 
+def test_generate_uri_includes_non_default_algorithm():
+    test_token = {
+        'id': 'SYMC26070843',
+        'counter': None,
+        'period': 30,
+        'algorithm': 'sha256',
+        'digits': 8,
+    }
+    test_secret = b'ZqeD\xd9wg]"\x12\x1f7\xc7v6"\xf0\x13\\i'
+    generated_uri = urlparse.urlparse(generate_otp_uri(test_token, test_secret))
+    params = urlparse.parse_qs(generated_uri.query)
+    assert params['algorithm'] == ['SHA256']
+    assert params['digits'] == ['8']
+
+def test_get_vip_credential_status_extracts_message():
+    html = '''
+    <html>
+      <span class="sixcode row">
+        Your VIP credential needs to be synced.
+      </span>
+    </html>
+    '''
+    assert provision._get_vip_credential_status(html) == 'your vip credential needs to be synced.'
+
+def test_check_token_interprets_status_and_uses_timeout():
+    token = {'id': 'SYMC26070843', 'period': 30}
+    secret = b'ZqeD\xd9wg]"\x12\x1f7\xc7v6"\xf0\x13\\i'
+    session = FakeSession([FakeResponse('<span class="sixcode row">Your VIP Credential is working correctly.</span>')])
+    assert check_token(token, secret, session=session, timestamp=30)
+    assert session.calls[0][0] == TEST_URL
+    assert session.calls[0][1]['timeout'] == DEFAULT_REQUEST_TIMEOUT
+
+def test_check_token_detects_sync_required_variants():
+    token = {'id': 'SYMC26070843', 'period': 30}
+    secret = b'ZqeD\xd9wg]"\x12\x1f7\xc7v6"\xf0\x13\\i'
+    session = FakeSession([FakeResponse('<span class="sixcode row">Your VIP credential needs to be synced.</span>')])
+    assert check_token(token, secret, session=session, timestamp=30) is False
+
+def test_sync_token_interprets_synced_status():
+    token = {'id': 'UBHE57586348', 'counter': 1, 'period': None}
+    secret = b'\x9a\x13\xcd2!\xad\xbd\x97R\xfcEE\xb6\x92e\xb4\x14\xb0\xfem'
+    session = FakeSession([FakeResponse('<span class="sixcode row">Your VIP Credential is successfully synced.</span>')])
+    assert sync_token(token, secret, session=session, timestamp=30)
+    assert token['counter'] == 3
+
+def test_path_type_accepts_symlink():
+    tempdir = tempfile.mkdtemp()
+    try:
+        target = os.path.join(tempdir, 'target')
+        link = os.path.join(tempdir, 'link')
+        with open(target, 'w') as fh:
+            fh.write('ok')
+        os.symlink(target, link)
+        assert PathType(exists=True, type='symlink')(link) == link
+    finally:
+        shutil.rmtree(tempdir)
+
 def provision_valid_token(token_model, attr, not_attr, check_sync=False):
     test_request = generate_request(token_model=token_model)
-    test_response = requests.post(PROVISIONING_URL, data=test_request)
+    test_response = requests.post(PROVISIONING_URL, data=test_request, timeout=DEFAULT_REQUEST_TIMEOUT)
     test_otp_token = get_token_from_response(test_response.content)
     assert test_otp_token[attr] is not None
     assert test_otp_token[not_attr] is None
@@ -136,7 +220,7 @@ def provision_valid_token(token_model, attr, not_attr, check_sync=False):
             sleep(2 * test_otp_token['period'])
         assert sync_token(test_otp_token, test_token_secret)
 
-@unittest.skipIf(IS_GITHUB_CI, reason='Network-based tests are unreliable in GitHub Actions CI')
+@unittest.skipUnless(RUN_LIVE_TESTS, reason='Set VIPACCESS_RUN_LIVE_TESTS=1 to run live Symantec integration tests')
 def test_check_TOTP_token_models():
     # Only try syncing one TOTP token, because it requires a delay.
     # Can we parallelize away? (https://nose.readthedocs.io/en/latest/doc_tests/test_multiprocess/multiprocess.html
@@ -147,12 +231,12 @@ def test_check_TOTP_token_models():
         first = False
 
 
-@unittest.skipIf(IS_GITHUB_CI, reason='Network-based tests are unreliable in GitHub Actions CI')
+@unittest.skipUnless(RUN_LIVE_TESTS, reason='Set VIPACCESS_RUN_LIVE_TESTS=1 to run live Symantec integration tests')
 def test_check_HOTP_token_models():
     for token_model in ('UBHE',):
         yield provision_valid_token, token_model, 'counter', 'period', True
 
-@unittest.skipIf(IS_GITHUB_CI, reason='Network-based tests are unreliable in GitHub Actions CI')
+@unittest.skipUnless(RUN_LIVE_TESTS, reason='Set VIPACCESS_RUN_LIVE_TESTS=1 to run live Symantec integration tests')
 def test_check_token_detects_invalid_token():
     test_token = {'id': 'SYMC26070843', 'period': 30}
     test_token_secret = b'ZqeD\xd9wg]"\x12\x1f7\xc7v6"\xf0\x13\\i'
