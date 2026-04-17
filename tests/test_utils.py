@@ -15,10 +15,16 @@
 #   limitations under the License.
 
 
+import argparse
+import hashlib
+import io
 import unittest
 import os
 import shutil
+import stat
 import tempfile
+from contextlib import redirect_stdout
+from unittest import mock
 IS_GITHUB_CI = os.getenv('GITHUB_ACTIONS')
 RUN_LIVE_TESTS = os.getenv('VIPACCESS_RUN_LIVE_TESTS') == '1' and not IS_GITHUB_CI
 
@@ -30,6 +36,8 @@ except ImportError:
 
 import requests
 
+import oath
+import vipaccess.__main__ as cli
 import vipaccess.provision as provision
 from vipaccess.patharg import PathType
 from vipaccess.provision import *
@@ -58,6 +66,22 @@ class FakeSession(object):
         return self.responses.pop(0)
 
 
+def sample_provisioning_response():
+    return b'<?xml version="1.0" encoding="UTF-8"?>\n<GetSharedSecretResponse RequestId="1412030064" Version="2.0" xmlns="http://www.verisign.com/2006/08/vipservice">\n  <Status>\n    <ReasonCode>0000</ReasonCode>\n    <StatusMessage>Success</StatusMessage>\n  </Status>\n  <SharedSecretDeliveryMethod>HTTPS</SharedSecretDeliveryMethod>\n  <SecretContainer Version="1.0">\n    <EncryptionMethod>\n      <PBESalt>u5lgf1Ek8WA0iiIwVkjy26j6pfk=</PBESalt>\n      <PBEIterationCount>50</PBEIterationCount>\n      <IV>Fsg1KafmAX80gUEDADijHw==</IV>\n    </EncryptionMethod>\n    <Device>\n      <Secret type="HOTP" Id="SYMC26070843">\n        <Issuer>OU = ID Protection Center, O = VeriSign, Inc.</Issuer>\n        <Usage otp="true">\n          <AI type="HMAC-SHA1-TRUNC-6DIGITS"/>\n          <TimeStep>30</TimeStep>\n          <Time>0</Time>\n          <ClockDrift>4</ClockDrift>\n        </Usage>\n        <FriendlyName>OU = ID Protection Center, O = VeriSign, Inc.</FriendlyName>\n        <Data>\n          <Cipher>ILBweOCEOoMBLJARzoeUIlu0+5m6b3khZljd5dozARk=</Cipher>\n          <Digest algorithm="HMAC-SHA1">MoaidW7XDzeTZJqhfRQCZEieARM=</Digest>\n        </Data>\n        <Expiry>2017-09-25T23:36:22.056Z</Expiry>\n      </Secret>\n    </Device>\n  </SecretContainer>\n  <UTCTimestamp>1412030065</UTCTimestamp>\n</GetSharedSecretResponse>'
+
+
+def make_token_file(contents):
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    with open(path, 'w') as fh:
+        fh.write(contents)
+    return path
+
+
+def make_parser():
+    return argparse.ArgumentParser(prog='vipaccess')
+
+
 def test_generate_request():
     expected = '<?xml version="1.0" encoding="UTF-8" ?>\n<GetSharedSecret Id="1412030064" Version="2.0"\n    xmlns="http://www.verisign.com/2006/08/vipservice"\n    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n    <TokenModel>SYMC</TokenModel>\n    <ActivationCode></ActivationCode>\n    <OtpAlgorithm type="HMAC-SHA1-TRUNC-6DIGITS"/>\n    <SharedSecretDeliveryMethod>HTTPS</SharedSecretDeliveryMethod>\n    <Extension extVersion="auth" xsi:type="vip:ProvisionInfoType"\n        xmlns:vip="http://www.verisign.com/2006/08/vipservice">\n        <AppHandle>iMac010200</AppHandle>\n        <ClientIDType>BOARDID</ClientIDType>\n        <ClientID>python-vipaccess-X.Y.Z</ClientID>\n        <DistChannel>Symantec</DistChannel>\n        <ClientTimestamp>1412030064</ClientTimestamp>\n        <Data>MyvXiv5vU27qBbRDN2HwbVAp0n+e67QWfWhXlbPb4Q8=</Data>\n    </Extension>\n</GetSharedSecret>'
     params = {
@@ -74,7 +98,6 @@ def test_generate_request():
     assert expected == request
 
 def test_get_token_from_response():
-    test_response = b'<?xml version="1.0" encoding="UTF-8"?>\n<GetSharedSecretResponse RequestId="1412030064" Version="2.0" xmlns="http://www.verisign.com/2006/08/vipservice">\n  <Status>\n    <ReasonCode>0000</ReasonCode>\n    <StatusMessage>Success</StatusMessage>\n  </Status>\n  <SharedSecretDeliveryMethod>HTTPS</SharedSecretDeliveryMethod>\n  <SecretContainer Version="1.0">\n    <EncryptionMethod>\n      <PBESalt>u5lgf1Ek8WA0iiIwVkjy26j6pfk=</PBESalt>\n      <PBEIterationCount>50</PBEIterationCount>\n      <IV>Fsg1KafmAX80gUEDADijHw==</IV>\n    </EncryptionMethod>\n    <Device>\n      <Secret type="HOTP" Id="SYMC26070843">\n        <Issuer>OU = ID Protection Center, O = VeriSign, Inc.</Issuer>\n        <Usage otp="true">\n          <AI type="HMAC-SHA1-TRUNC-6DIGITS"/>\n          <TimeStep>30</TimeStep>\n          <Time>0</Time>\n          <ClockDrift>4</ClockDrift>\n        </Usage>\n        <FriendlyName>OU = ID Protection Center, O = VeriSign, Inc.</FriendlyName>\n        <Data>\n          <Cipher>ILBweOCEOoMBLJARzoeUIlu0+5m6b3khZljd5dozARk=</Cipher>\n          <Digest algorithm="HMAC-SHA1">MoaidW7XDzeTZJqhfRQCZEieARM=</Digest>\n        </Data>\n        <Expiry>2017-09-25T23:36:22.056Z</Expiry>\n      </Secret>\n    </Device>\n  </SecretContainer>\n  <UTCTimestamp>1412030065</UTCTimestamp>\n</GetSharedSecretResponse>'
     expected_token = {
         'salt': b'\xbb\x99`\x7fQ$\xf1`4\x8a"0VH\xf2\xdb\xa8\xfa\xa5\xf9',
         'iteration_count': 50,
@@ -88,7 +111,7 @@ def test_get_token_from_response():
         'digits': 6,
         'counter': None,
     }
-    token = get_token_from_response(test_response)
+    token = get_token_from_response(sample_provisioning_response())
     assert token.pop('timeskew', None) is not None
     assert expected_token == token
 
@@ -161,6 +184,20 @@ def test_generate_uri_includes_non_default_algorithm():
     assert params['algorithm'] == ['SHA256']
     assert params['digits'] == ['8']
 
+def test_generate_otp_respects_digits_algorithm_and_period():
+    secret = b'12345678901234567890'
+    token = {'period': 60, 'digits': 8, 'algorithm': 'sha256'}
+    secret_hex = oath._utils.tohex(secret)
+    expected = str(oath.totp(secret_hex, period=60, t=120, format='dec', hash=hashlib.sha256)).zfill(8)[-8:]
+    assert generate_otp(token, secret, timestamp=120) == expected
+
+def test_generate_otp_respects_hotp_counter():
+    secret = b'12345678901234567890'
+    token = {'counter': 1, 'digits': 8, 'algorithm': 'sha1'}
+    secret_hex = oath._utils.tohex(secret)
+    expected = str(oath.hotp(secret_hex, 1, format='dec', hash=hashlib.sha1)).zfill(8)[-8:]
+    assert generate_otp(token, secret) == expected
+
 def test_get_vip_credential_status_extracts_message():
     html = '''
     <html>
@@ -202,6 +239,105 @@ def test_path_type_accepts_symlink():
         os.symlink(target, link)
         assert PathType(exists=True, type='symlink')(link) == link
     finally:
+        shutil.rmtree(tempdir)
+
+def test_parse_token_file_allows_blank_lines_and_comments():
+    token = cli._parse_token_file([
+        '# comment\n',
+        '\n',
+        'version 1\n',
+        'secret ABCDEFG\n',
+        'id SYMC12345678\n',
+        'expiry 2020-01-01T00:00:00.000Z\n',
+    ])
+    assert token['period'] == 30
+    assert token['digits'] == 6
+    assert token['algorithm'] == 'sha1'
+
+def test_parse_token_file_rejects_malformed_line():
+    with unittest.TestCase().assertRaisesRegex(ValueError, 'line 2 is not in'):
+        cli._parse_token_file([
+            'version 1\n',
+            'secret-only\n',
+        ])
+
+def test_parse_token_file_rejects_duplicate_key():
+    with unittest.TestCase().assertRaisesRegex(ValueError, 'duplicate key'):
+        cli._parse_token_file([
+            'version 1\n',
+            'secret ABC\n',
+            'secret DEF\n',
+        ])
+
+def test_parse_token_file_rejects_unsupported_version():
+    with unittest.TestCase().assertRaisesRegex(ValueError, 'expected'):
+        cli._parse_token_file([
+            'version 2\n',
+            'secret ABC\n',
+        ])
+
+def test_get_token_from_response_rejects_both_counter_and_period():
+    response = sample_provisioning_response().replace(b'</Usage>', b'<Counter>1</Counter>\n        </Usage>')
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, 'exactly one of counter or period'):
+        get_token_from_response(response)
+
+def test_get_token_from_response_rejects_missing_counter_and_period():
+    response = sample_provisioning_response().replace(b'<TimeStep>30</TimeStep>\n', b'')
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, 'exactly one of counter or period'):
+        get_token_from_response(response)
+
+def test_show_uses_default_totp_period_from_token_file():
+    dotfile = make_token_file('version 1\nsecret GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\nid SYMC12345678\n')
+    args = argparse.Namespace(secret=None, dotfile=dotfile, verbose=False)
+    output = io.StringIO()
+    try:
+        with mock.patch('vipaccess.__main__.time.time', return_value=59):
+            with redirect_stdout(output):
+                cli.show(make_parser(), args)
+        key_hex = oath._utils.tohex(oath.google_authenticator.lenient_b32decode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'))
+        assert output.getvalue().strip() == oath.totp(key_hex, t=59)
+    finally:
+        os.unlink(dotfile)
+
+def test_show_uses_non_default_totp_period_from_token_file():
+    dotfile = make_token_file('version 1\nsecret GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\nid SYMC12345678\nperiod 60\n')
+    args = argparse.Namespace(secret=None, dotfile=dotfile, verbose=False)
+    output = io.StringIO()
+    try:
+        with mock.patch('vipaccess.__main__.time.time', return_value=120):
+            with redirect_stdout(output):
+                cli.show(make_parser(), args)
+        key_hex = oath._utils.tohex(oath.google_authenticator.lenient_b32decode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'))
+        assert output.getvalue().strip() == oath.totp(key_hex, period=60, t=120)
+    finally:
+        os.unlink(dotfile)
+
+def test_show_uses_hotp_counter_from_token_file():
+    dotfile = make_token_file('version 1\nsecret GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\nid SYMC12345678\ncounter 1\n')
+    args = argparse.Namespace(secret=None, dotfile=dotfile, verbose=False)
+    output = io.StringIO()
+    try:
+        with redirect_stdout(output):
+            cli.show(make_parser(), args)
+        key_hex = oath._utils.tohex(oath.google_authenticator.lenient_b32decode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'))
+        assert output.getvalue().strip() == oath.hotp(key_hex, 1)
+    finally:
+        os.unlink(dotfile)
+
+def test_write_token_file_restores_umask_and_writes_secure_permissions():
+    tempdir = tempfile.mkdtemp()
+    dotfile = os.path.join(tempdir, 'vipaccess')
+    previous_umask = os.umask(0o022)
+    try:
+        cli._write_token_file(dotfile, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567', {
+            'id': 'SYMC12345678',
+            'expiry': '2030-01-01T00:00:00.000Z',
+        })
+        current_umask = os.umask(previous_umask)
+        assert current_umask == 0o022
+        assert stat.S_IMODE(os.stat(dotfile).st_mode) == 0o600
+    finally:
+        os.umask(previous_umask)
         shutil.rmtree(tempdir)
 
 def provision_valid_token(token_model, attr, not_attr, check_sync=False):

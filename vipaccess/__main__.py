@@ -19,6 +19,7 @@ except ImportError:
 
 EXCL_WRITE = 'x' if sys.version_info>=(3,3) else 'wx'
 TOKEN_MODEL_REFERENCE_PAGE = 'https://support.symantec.com/us/en/article.tech239895.html'
+TOKEN_FILE_INT_FIELDS = frozenset(['counter', 'digits', 'period'])
 
 # http://stackoverflow.com/a/26379693/20789
 
@@ -57,6 +58,97 @@ def check_token_model(val):
 argparse.ArgumentParser.set_default_subparser = set_default_subparser
 
 ########################################
+
+
+def _parse_token_file(lines):
+    token = {}
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            raise ValueError('line %d is not in "<key> <value>" format' % line_number)
+        key, value = parts
+        if key in token:
+            raise ValueError('duplicate key %r on line %d' % (key, line_number))
+        if key in TOKEN_FILE_INT_FIELDS:
+            try:
+                value = int(value)
+            except ValueError:
+                raise ValueError('line %d has a non-integer value for %s' % (line_number, key))
+        token[key] = value
+
+    if 'version' not in token:
+        raise ValueError('does not specify version')
+    if token['version'] != '1':
+        raise ValueError("specifies version %r, rather than expected '1'" % token['version'])
+    if 'secret' not in token:
+        raise ValueError('does not specify secret')
+    if token.get('counter') is not None and token.get('counter') < 0:
+        raise ValueError('counter must be non-negative')
+    if token.get('period') is not None and token['period'] <= 0:
+        raise ValueError('period must be positive')
+    if token.get('digits') is not None and token['digits'] <= 0:
+        raise ValueError('digits must be positive')
+    if token.get('counter') is not None and token.get('period') is not None:
+        raise ValueError('specifies both counter and period')
+
+    token.setdefault('digits', 6)
+    token['algorithm'] = token.get('algorithm', 'sha1').lower()
+    if token.get('counter') is None and token.get('period') is None:
+        token['period'] = 30
+    return token
+
+
+def _load_token_file(p, dotfile):
+    try:
+        with open(dotfile, "r") as fh:
+            return _parse_token_file(fh)
+    except (IOError, OSError) as e:
+        p.error('error reading %s: %s' % (dotfile, e))
+    except ValueError as e:
+        p.error('%s %s' % (dotfile, e))
+
+
+def _token_from_secret(secret, identity=None):
+    token = {
+        'secret': secret,
+        'digits': 6,
+        'algorithm': 'sha1',
+        'period': 30,
+    }
+    if identity:
+        token['id'] = identity
+    return token
+
+
+def _get_token_and_secret(p, args):
+    if args.secret:
+        token = _token_from_secret(args.secret, getattr(args, 'identity', None))
+    else:
+        token = _load_token_file(p, args.dotfile)
+    return token, token['secret']
+
+
+def _decode_secret(p, secret):
+    try:
+        return oath.google_authenticator.lenient_b32decode(secret)
+    except Exception as e:
+        p.error('error interpreting secret as base32: %s' % e)
+
+
+def _write_token_file(dotfile_path, otp_secret_b32, otp_token):
+    old_umask = os.umask(0o077) # stoken does this too (security)
+    try:
+        with open(os.path.expanduser(dotfile_path), EXCL_WRITE) as dotfile:
+            dotfile.write('version 1\n')
+            dotfile.write('secret %s\n' % otp_secret_b32)
+            dotfile.write('id %s\n' % otp_token['id'])
+            dotfile.write('expiry %s\n' % otp_token['expiry'])
+            return dotfile.name
+    finally:
+        os.umask(old_umask)
 
 def provision(p, args):
     print("Generating request...")
@@ -116,80 +208,52 @@ def provision(p, args):
             q.add_data(otp_uri)
             q.print_ascii(invert=True)
     elif otp_token['digits']==6 and otp_token['algorithm']=='sha1' and otp_token['period']==30:
-        os.umask(0o077) # stoken does this too (security)
-        with open(os.path.expanduser(args.dotfile), EXCL_WRITE) as dotfile:
-            dotfile.write('version 1\n')
-            dotfile.write('secret %s\n' % otp_secret_b32)
-            dotfile.write('id %s\n' % otp_token['id'])
-            dotfile.write('expiry %s\n' % otp_token['expiry'])
-        print('Credential created and saved successfully: ' + dotfile.name)
+        dotfile_name = _write_token_file(args.dotfile, otp_secret_b32, otp_token)
+        print('Credential created and saved successfully: ' + dotfile_name)
         print('You will need the ID to register this credential: ' + otp_token['id'])
     else:
         p.error('Cannot currently save a token of this type (try -p to print)')
 
 def check(p, args):
-    if args.secret:
-        d, secret = {'id': args.identity or 'Unknown'}, args.secret
-    else:
-        with open(args.dotfile, "r") as dotfile:
-            d = dict( l.strip().split(None, 1) for l in dotfile )
-        if 'version' not in d:
-            p.error('%s does not specify version' % args.dotfile)
-        elif d['version'] != '1':
-            p.error("%s specifies version %r, rather than expected '1'" % (args.dotfile, d['version']))
-        elif 'secret' not in d:
-            p.error('%s does not specify secret' % args.dotfile)
-        secret = d['secret']
+    d, secret = _get_token_and_secret(p, args)
 
     if d.get('id', 'Unknown') == 'Unknown':
         p.error("Token identity unknown; specify with -I/--identity")
 
-    try:
-        key = oath.google_authenticator.lenient_b32decode(secret)
-    except Exception as e:
-        p.error('error interpreting secret as base32: %s' % e)
-
-    d.setdefault('period', 30)
+    key = _decode_secret(p, secret)
 
     print("Checking token...")
     session = vp.requests.Session()
     try:
-        for skew in (None, +d['period']//2, -d['period']//2, +d['period'], -d['period'], +d['period']*3//2, -d['period']*3//2):
-            if skew is None:
-                if vp.check_token(d, key, session):
-                    print("Token is valid and working.")
-                    break
+        if d.get('counter') is not None:
+            if vp.check_token(d, key, session):
+                print("Token is valid and working.")
             else:
-                print("Trying %+d seconds timeskew..." % skew)
-                if vp.check_token(d, key, session, timestamp=time.time()+skew):
-                    print("Token is valid and working, but we had to skew by %+d seconds (check your system time)\n" % skew)
-                    break
+                print("WARNING: Something went wrong--the token could not be validated.\n",
+                      file=sys.stderr)
         else:
-            print("WARNING: Something went wrong--the token could not be validated.\n",
-                  file=sys.stderr)
+            period = d.get('period', 30)
+            for skew in (None, +period//2, -period//2, +period, -period, +period*3//2, -period*3//2):
+                if skew is None:
+                    if vp.check_token(d, key, session):
+                        print("Token is valid and working.")
+                        break
+                else:
+                    print("Trying %+d seconds timeskew..." % skew)
+                    if vp.check_token(d, key, session, timestamp=time.time()+skew):
+                        print("Token is valid and working, but we had to skew by %+d seconds (check your system time)\n" % skew)
+                        break
+            else:
+                print("WARNING: Something went wrong--the token could not be validated.\n",
+                      file=sys.stderr)
     except requests.RequestException as e:
         p.error('Network error validating token with Symantec: %s' % e)
+    except ValueError as e:
+        p.error(str(e))
 
 def uri(p, args):
-    if args.secret:
-        d, secret = {'id': args.identity or 'Unknown'}, args.secret
-    else:
-        if not os.path.exists(args.dotfile):
-            p.error("File %s does not exist." % args.dotfile)
-        with open(args.dotfile, "r") as dotfile:
-            d = dict( l.strip().split(None, 1) for l in dotfile )
-        if 'version' not in d:
-            p.error('%s does not specify version' % args.dotfile)
-        elif d['version'] != '1':
-            p.error("%s specifies version %r, rather than expected '1'" % (args.dotfile, d['version']))
-        elif 'secret' not in d:
-            p.error('%s does not specify secret' % args.dotfile)
-        secret = d['secret']
-
-    try:
-        key = oath.google_authenticator.lenient_b32decode(secret)
-    except Exception as e:
-        p.error('error interpreting secret as base32: %s' % e)
+    d, secret = _get_token_and_secret(p, args)
+    key = _decode_secret(p, secret)
     if args.verbose:
         print('Token URI:\n    ', file=sys.stderr, end='')
 
@@ -202,28 +266,19 @@ def uri(p, args):
         q.print_ascii(invert=True)
 
 def show(p, args):
-    if args.secret:
-        secret = args.secret
-    else:
-        with open(args.dotfile, "r") as dotfile:
-            d = dict( l.strip().split(None, 1) for l in dotfile )
-        if 'version' not in d:
-            p.error('%s does not specify version' % args.dotfile)
-        elif d['version'] != '1':
-            p.error("%s specifies version %r, rather than expected '1'" % (args.dotfile, d['version']))
-        elif 'secret' not in d:
-            p.error('%s does not specify secret' % args.dotfile)
-        secret = d.get('secret')
-        if args.verbose:
-            if 'id' in d: print('Token ID: %s' % d['id'], file=sys.stderr)
-            if 'expiry' in d: print('Token expiration: %s' % d['expiry'], file=sys.stderr)
-            sys.stderr.write('\n')
+    d, secret = _get_token_and_secret(p, args)
+    if not args.secret and args.verbose:
+        if 'id' in d: print('Token ID: %s' % d['id'], file=sys.stderr)
+        if 'expiry' in d: print('Token expiration: %s' % d['expiry'], file=sys.stderr)
+        if d.get('counter') is not None: print('Token counter: %s' % d['counter'], file=sys.stderr)
+        elif d.get('period') is not None: print('Token period: %s' % d['period'], file=sys.stderr)
+        sys.stderr.write('\n')
 
+    key = _decode_secret(p, secret)
     try:
-        key = oath._utils.tohex( oath.google_authenticator.lenient_b32decode(secret) )
-    except Exception as e:
-        p.error('error interpreting secret as base32: %s' % e)
-    print(oath.totp(key))
+        print(vp.generate_otp(d, key, timestamp=time.time()))
+    except ValueError as e:
+        p.error(str(e))
 
 def main():
     p = argparse.ArgumentParser()
@@ -258,7 +313,7 @@ def main():
     m.add_argument('-f', '--dotfile', type=PathType(type='file', exists=True), default=os.path.expanduser('~/.vipaccess'),
                    help="File in which the credential is stored (default ~/.vipaccess)")
     m.add_argument('-s', '--secret', action=UnsetDotfileAndStore, nargs=1,
-                   help="Specify the token secret to test (base32 encoded)")
+                   help="Specify the token secret to test (base32 encoded; validated as a 30-second TOTP unless metadata is loaded from a file)")
     pcheck.add_argument('-I', '--identity',
                        help="Specify the ID of the token to test (normally starts with VS or SYMC)")
     pcheck.set_defaults(func=check)

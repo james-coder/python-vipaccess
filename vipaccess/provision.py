@@ -112,6 +112,21 @@ def _get_vip_credential_status(response_text):
     return ' '.join(response_text.split()).lower()
 
 
+def _get_hash_fn(algorithm):
+    algorithm = (algorithm or 'sha1').lower()
+    hash_fn = getattr(hashlib, algorithm, None)
+    if hash_fn is None:
+        raise ValueError('unsupported hash algorithm %r' % algorithm)
+    return hash_fn
+
+
+def _normalize_otp(raw_otp, digits):
+    digits = int(digits)
+    if digits <= 0:
+        raise ValueError('digits must be positive')
+    return str(raw_otp).zfill(digits)[-digits:]
+
+
 def get_provisioning_response(request, session=requests, timeout=DEFAULT_REQUEST_TIMEOUT):
     return _post(session, PROVISIONING_URL, data=request, timeout=timeout)
 
@@ -154,7 +169,8 @@ def get_token_from_response(response_xml):
 
         # Apparently, secret.attrib['type'] == 'HOTP' in all cases, so the presence or absence of
         # the counter or period fields is the only sane way to distinguish TOTP from HOTP tokens.
-        assert (token['counter'] is not None and token['period'] is None) or (token['period'] is not None and token['counter'] is None)
+        if (token['counter'] is not None) == (token['period'] is not None):
+            raise RuntimeError('invalid token metadata: expected exactly one of counter or period')
 
         algorithm = usage.find('v:AI', ns).attrib['type'].split('-')
         if len(algorithm)==4 and algorithm[0]=='HMAC' and algorithm[2]=='TRUNC' and algorithm[3].endswith('DIGITS'):
@@ -211,15 +227,24 @@ def generate_otp_uri(token, secret, issuer='VIP Access', image=None):
     token_parameters['parameters'] = urllib.urlencode(data, safe=':/')
     return 'otpauth://%(otp_type)s/%(issuer)s:%(account_name)s?%(parameters)s' % token_parameters
 
+
+def generate_otp(token, secret, timestamp=None, counter=None):
+    secret_hex = binascii.b2a_hex(secret).decode('ascii')
+    digits = token.get('digits', 6)
+    hash_fn = _get_hash_fn(token.get('algorithm', 'sha1'))
+    if counter is None:
+        counter = token.get('counter')
+
+    if counter is not None:
+        raw_otp = hotp(secret_hex, counter=counter, format='dec', hash=hash_fn)
+    else:
+        period = int(token.get('period', 30) or 30)
+        raw_otp = totp(secret_hex, period=period, t=timestamp, format='dec', hash=hash_fn)
+    return _normalize_otp(raw_otp, digits)
+
 def check_token(token, secret, session=requests, timestamp=None, timeout=DEFAULT_REQUEST_TIMEOUT):
     '''Check the validity of the generated token.'''
-    secret_hex = binascii.b2a_hex(secret).decode('ascii')
-    if token.get('counter') is not None: # HOTP
-        otp = hotp(secret_hex, counter=token['counter'])
-    elif token.get('period'): # TOTP
-        otp = totp(secret_hex, period=token['period'], t=timestamp)
-    else: # Assume TOTP with default period 30 (FIXME)
-        otp = totp(secret_hex, t=timestamp)
+    otp = generate_otp(token, secret, timestamp=timestamp)
     data = {'cr%s'%d:c for d,c in enumerate(otp, 1)}
     data['cred'] = token['id']
     data['continue'] = 'otp_check'
@@ -236,19 +261,16 @@ def check_token(token, secret, session=requests, timestamp=None, timeout=DEFAULT
 
 def sync_token(token, secret, session=requests, timestamp=None, timeout=DEFAULT_REQUEST_TIMEOUT):
     '''Sync the generated token. This will fail for a TOTP token if performed less than 2 periods after the last sync or check.'''
-    secret_hex = binascii.b2a_hex(secret).decode('ascii')
     if timestamp is None:
         timestamp = int(time.time())
     if token.get('counter') is not None: # HOTP
         # This reliably fails with -1, 0
-        otp1 = hotp(secret_hex, counter=token['counter'])
-        otp2 = hotp(secret_hex, counter=token['counter']+1)
-    elif token.get('period'): # TOTP
-        otp1 = totp(secret_hex, period=token['period'], t=timestamp-token['period'])
-        otp2 = totp(secret_hex, period=token['period'], t=timestamp)
+        otp1 = generate_otp(token, secret, counter=token['counter'])
+        otp2 = generate_otp(token, secret, counter=token['counter'] + 1)
     else: # Assume TOTP with default period 30 (FIXME)
-        otp1 = totp(secret_hex, t=timestamp-30)
-        otp2 = totp(secret_hex, t=timestamp)
+        period = int(token.get('period', 30) or 30)
+        otp1 = generate_otp(token, secret, timestamp=timestamp - period)
+        otp2 = generate_otp(token, secret, timestamp=timestamp)
 
     data = {'cr%s'%d:c for d,c in enumerate(otp1, 1)}
     data.update({'ncr%s'%d:c for d,c in enumerate(otp2, 1)})
